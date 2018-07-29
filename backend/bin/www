@@ -1,0 +1,622 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('backend:server');
+var http = require('http');
+var jwt = require('jsonwebtoken');
+
+// Models
+var User = require('../models/User');
+var Fight = require('../models/Fight');
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT);
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+console.log('Launch on http://localhost:' + port);
+
+
+var io = require('socket.io')(server);
+
+function authWs(socket, next) {
+  if (socket.handshake.query && socket.handshake.query.token) {
+    try {
+      var payload = jwt.verify(socket.handshake.query.token, process.env.SECRET);
+      User.findById(payload.sub, function (err, user) {
+        socket.user = user;
+        User.
+          findByIdAndUpdate(user.id, { $set: { status: 'Online' } }, { new: true }, function (err, user) {
+            if (err) return handleError(err);
+            next();
+        });
+      });
+    } catch (err) {
+      return next();
+    }
+  } else {
+    next();
+  }
+};
+
+var chat = io.of('/chat');
+chat.use(authWs);
+var status = io.of('/status');
+status.use(authWs);
+var wait = io.of('/wait');
+wait.use(authWs);
+var games = io.of('/games');
+games.use(authWs);
+
+io.on('disconnect', function () {
+  User.findByIdAndRemove(socket.user.id)
+  .update({
+    status: 'Offline'
+  }).exec(function (err, user){res.status(200);});
+});
+
+chat.on('connection', function (socket) {
+  socket.on('SEND_MESSAGE', function (data) {
+    data.user = socket.user.name;
+    chat.emit('MESSAGE', data);
+  });
+});
+
+wait.on('connection', function(socket) {
+  socket.on('QUICKFIGHT', function(data) {
+    User.findByIdAndUpdate(socket.user.id)
+    .update({
+      status: 'Waiting'
+      }).exec(function () {
+      wait.emit('CHANGE', {});
+      User.
+        find({
+          'status': 'Waiting'
+        })
+        .sort({ point: 1 })
+        .exec(function (err, users) {
+          if (err) return handleError(err);
+          var index = users.findIndex(function (element) {
+            return element.id == socket.user.id;
+          });
+          var taille = users.length;
+          if (taille == 1) {
+            wait.emit('QUICKFIGHT_ERROR', { success: false, msg: 'No other player' });
+          }
+          var indexChoose = 0;
+          if (index == taille - 1) {
+            indexChoose = index - 1;
+          } else if (index == 0) {
+            indexChoose = 1;
+          } else {
+            if ((socket.user.point - users[index - 1]) > (users[index + 1] - socket.user.point)) {
+              indexChoose = index + 1;
+            } else {
+              indexChoose = index - 1;
+            }
+          }
+          fight = new Fight({
+            player1: socket.user.id,
+            player2: users[indexChoose].id,
+            x1: 10,
+            x2: 440,
+            hitbox1: 0,
+            hitbox2: 0,
+            life1: 100,
+            life2: 100,
+          });
+          fight.save(function (err) {
+            if (err) return handleError(err);
+            wait.emit('QUICKFIGHT_SUCCESS', { sucess: true, fight: fight.toJSON() });
+          });
+        });
+    });
+  });
+});
+
+status.on('connection', function (socket) {
+  User.
+    find()
+    .where('status').in(['Online', 'Fight', 'Waiting'])
+    .select('name status point')
+    .exec(function(err, users) {
+      if(err) return handleError(err);
+      status.emit('WAITING', users);
+  });
+
+  socket.on('INVIT', function (data) {
+    User
+    .findOne({
+      _id: data.player2,
+      status: 'Online'
+    })
+    .exec(function(err, user2) {
+      if (err) {return res.status(501);}
+      User
+        .findOne({
+          _id: data.player1,
+          status: 'Online'
+        })
+        .exec(function (err, user1) {
+          if (err) { return res.status(501); }
+          status.emit("ASK_INVIT", {
+            player1: user1,
+            player2: user2
+          });
+        });
+    });
+  });
+
+  socket.on('RES_INVIT', function (data) {
+    if (data.res == false) {
+      status.emit("RES_NEG_INVIT", {
+        player1: data.player1,
+        player2: data.player2
+      });
+    } else {
+      User
+        .findOne({
+          _id: data.player2,
+          status: 'Online'
+        })
+        .exec(function (err, user2) {
+          if (err) { return res.status(501); }
+          User
+            .findOne({
+              _id: data.player1,
+              status: 'Online'
+            })
+            .exec(function (err, user1) {
+              if (err) { return res.status(501); }
+              var fight = new Fight({
+                player1: data.player1,
+                player2: data.player2,
+                x1: 10,
+                x2: 440,
+                hitbox1: 0,
+                hitbox2: 0,
+                life1: 100,
+                life2: 100,
+              });
+              fight.save(function (err) {
+                if (err) return handleError(err);
+                status.emit('RES_POS_INVIT', { sucess: true, fight: fight.toJSON() });
+              });
+            });
+        });
+    }
+  });
+});
+
+games.on('connection', function (socket) {
+  socket.on('JOIN', function (data) {
+    socket.join(data.id);
+    Fight
+    .findById(data.id)
+      .populate('player1')
+      .populate('player2')
+    .exec(function(err, fightGet){
+      if (err) {return res.status(501);}
+      fight = fightGet;
+      User.findByIdAndUpdate(fightGet.player1)
+      .update({
+        status: 'Fight'
+      })
+      .exec(function (err, player1){
+        User.findByIdAndUpdate(fightGet.player2)
+          .update({
+            status: 'Fight'
+          })
+          .exec(function (err, player1) {
+            games.to(data.id).emit('START', { sucess: true, fight: fight });
+          });
+      });
+    });
+  });
+  
+  socket.on('WINNER', function (data) {
+    Fight
+      .findById(data.id)
+      .exec(function (err, fightGet) {
+        if (err) { return res.status(501); }
+        fightGet.time = new Date(); 
+        fightGet.save(function () {
+          User
+            .findById(fightGet.player1)
+            .exec(function (err, player1) {
+              User
+                .findById(fightGet.player2)
+                .exec(function (err, player2) {
+                  if (data.player == '1') {
+                    player1.point += 100 + (10 * (player2.point / player1.point));
+                    player1.status = 'Online';
+                    player2.status = 'Online';
+                    player1.save(function () {
+                      player2.save(function () {
+                        games.to(data.id).emit('END', {});
+                      });
+                    });
+                  } else {
+                    player2.point += 100 + (10 * (player1.point / player2.point));
+                    player1.status = 'Online';
+                    player2.status = 'Online';
+                    player1.save(function () {
+                      player2.save(function () {
+                        games.to(data.id).emit('END', {});
+                      });
+                    });
+                  }
+                });
+            });
+        });
+      });
+  });
+
+  socket.on('RIGHT', function (data) {
+    if (data.player == '1') {
+      Fight
+      .findById(data.id)
+        .exec(function (err, fightGet) {
+          if (fightGet.x1 < 900) {
+            fightGet.save(function () {
+              games.to(data.id).emit('HORIZON', { player: data.player, x: fightGet.x1 });
+            });
+            fightGet.x1 += 10; 
+          }
+        });
+    } else {
+      Fight
+        .findById(data.id)
+        .exec(function (err, fightGet) {
+          if (fightGet.x2 < 900) {
+            fightGet.x2 += 10;
+            fightGet.save(function () {
+              games.to(data.id).emit('HORIZON', { player: data.player, x: fightGet.x2 });
+            });
+          }
+        });
+    }
+  });
+  socket.on('LEFT', function (data) {
+    if (data.player == '1') {
+      Fight
+        .findById(data.id)
+        .exec(function (err, fightGet) {
+          if (fightGet.x1 > 0) {
+            fightGet.x1 -= 10;
+            fightGet.save(function () {
+              games.to(data.id).emit('HORIZON', { player: data.player, x: fightGet.x1 });
+            });
+          }
+        });
+    } else {
+      Fight
+        .findById(data.id)
+        .exec(function (err, fightGet) {
+          if (fightGet.x2 > 0) {
+            fightGet.x2 -= 10;
+            fightGet.save(function () {
+              games.to(data.id).emit('HORIZON', { player: data.player, x: fightGet.x2 });
+            });
+          }
+        });
+    }
+  });
+  
+  socket.on('UP', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('UP', { player: data.player });
+      setTimeout(function () {
+        Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: 1
+          }).exec(function (err, fightGet) {
+          });
+      }, 500);
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+          .update({
+            hitbox1: 0
+          }).exec(function (err, fightGet) {
+          });
+      }, 1500);
+    } else {
+      games.to(data.id).emit('UP', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+          .update({
+            hitbox2: 1
+          }).exec(function (err, fightGet) {
+          });
+      }, 500);
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+        .update({
+          hitbox2: 0
+        }).exec(function (err, fightGet) {
+        });
+      }, 1500);
+    }
+  });
+  socket.on('DOWN', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('DOWN', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: -1
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: 0
+        }).exec(function (err, fightGet) {
+        });
+      }, 1500);
+    } else {
+      games.to(data.id).emit('DOWN', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox2: -1
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+          .update({
+            hitbox2: 0
+          }).exec(function (err, fightGet) {
+          });
+      }, 1500);
+    }
+  });
+  socket.on('PUNCH', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('PUNCH_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 50) - (fightGet.x2 + 50)) < 100 && (fightGet.hitbox2 == 0 || fightGet.hitbox2 == 1)) {
+              fightGet.life2 -= 10;
+              fightGet.save(function () {
+                games.to(data.id).emit('PUNCH', { player: data.player, life: fightGet.life2 });
+              });
+            }
+          });
+      }, 500);
+    } else {
+      games.to(data.id).emit('PUNCH_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 50) - (fightGet.x2 + 50)) < 100 && (fightGet.hitbox1 == 0 || fightGet.hitbox1 == 1)) {
+              fightGet.life1 -= 10;
+              fightGet.save(function () {
+                games.to(data.id).emit('PUNCH', { player: data.player, life: fightGet.life1 });
+              });
+            }
+          });
+      }, 500);
+    }
+  });
+  socket.on('LEG', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('LEG_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 50) - (fightGet.x2 + 50)) < 100 && (fightGet.hitbox2 == 0 || fightGet.hitbox2 == -1)) {
+              fightGet.life2 -= 10;
+              fightGet.save(function () {
+                games.to(data.id).emit('LEG', { player: data.player, life: fightGet.life2 });
+              });
+            }
+          });
+      }, 500);
+    } else {
+      games.to(data.id).emit('LEG_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 50) - (fightGet.x2 + 50)) < 100 && (fightGet.hitbox1 == 0 || fightGet.hitbox1 == -1)) {
+              fightGet.life1 -= 10;
+              fightGet.save(function () {
+                games.to(data.id).emit('LEG', { player: data.player, life: fightGet.life1 });
+              });
+            }
+          });
+      }, 500);
+    }
+  });
+  socket.on('BLOCK', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('BLOCK', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: 2
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: 0
+        }).exec(function (err, fightGet) {
+        });
+      }, 500);
+    } else {
+      games.to(data.id).emit('BLOCK', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox2: 2
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+        .update({
+          hitbox2: 0
+        }).exec(function (err, fightGet) {
+        });
+      }, 500);
+    }
+  });
+  socket.on('BLOCKBAS', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('BLOCKBAS', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox1: -2
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+          .update({
+            hitbox1: 0
+          }).exec(function (err, fightGet) {
+          });
+      }, 500);
+    } else {
+      games.to(data.id).emit('BLOCKBAS', { player: data.player });
+      Fight
+        .findByIdAndUpdate(data.id)
+        .update({
+          hitbox2: -2
+        }).exec(function (err, fightGet) {
+        });
+      setTimeout(function () {
+        Fight
+          .findByIdAndUpdate(data.id)
+          .update({
+            hitbox2: 0
+          }).exec(function (err, fightGet) {
+          });
+      }, 500);
+    }
+  });
+  socket.on('SUPER', function (data) {
+    if (data.player == '1') {
+      games.to(data.id).emit('SUPER_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 50) - (fightGet.x2 + 50)) < 60 && (fightGet.hitbox2 == 0 || fightGet.hitbox2 == 1)) {
+              fightGet.life2 -= 25;
+              fightGet.save(function () {
+                games.to(data.id).emit('SUPER', { player: data.player, life: fightGet.life2 });
+              });
+            }
+          });
+      }, 1500);
+    } else {
+      games.to(data.id).emit('SUPER_START', { player: data.player });
+      setTimeout(function () {
+        Fight
+          .findById(data.id)
+          .exec(function (err, fightGet) {
+            if (Math.abs((fightGet.x1 + 25) - (fightGet.x2 + 25)) < 60 && (fightGet.hitbox1 == 0 || fightGet.hitbox1 == -1)) {
+              fightGet.life1 -= 25;
+              fightGet.save(function () {
+                games.to(data.id).emit('SUPER', { player: data.player, life: fightGet.life1 });
+              });
+            }
+          });
+      }, 1500);
+    }
+  });
+});
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
